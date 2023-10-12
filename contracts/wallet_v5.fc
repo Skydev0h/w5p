@@ -7,6 +7,10 @@
 
 ;; LDUQ: s - x s' -1 or s 0 --IFNOTRET--> x s' or RET
 (int, slice) load_uint32_or_ret(slice s) impure asm "32 LDUQ" "IFNOTRET";
+(int, slice) load_uint32_or_ret_alt(slice s) impure asm "32 LDUQ" "IFNOTRETALT";
+(int, slice) load_uint32_or_exit(slice s) impure asm "32 LDUQ" "0 THROWIFNOT";
+
+() prepare_for_retalt() impure asm "SAMEALT";
 
 {-
   var flags = full_msg_slice~load_uint(4);  ;; int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddressInt ...
@@ -16,13 +20,25 @@
   }
 -}
 () return_if_bounce(int flags) impure asm "1 PUSHINT" "AND" "IFRET";
+() ret_alt_if_bounce(int flags) impure asm "1 PUSHINT" "AND" "IFRETALT";
+() exit_if_bounce(int flags) impure asm "1 PUSHINT" "AND" "0 THROWIF";
 
 () return_if_not_equal(int a, int b) impure asm "EQUAL" "IFNOTRET";
 () return_if_not(int a) impure asm "IFNOTRET";
 
-(slice) udict_get_or_return(cell dict, int key_len, int index) impure asm(index dict key_len) "DICTUGET IFNOTRET";
+() ret_alt_if_not_equal(int a, int b) impure asm "EQUAL" "IFNOTRETALT";
+() ret_alt_if_not(int a) impure asm "IFNOTRETALT";
 
-() ignore_int_params(int msg_value, cell full_msg) impure asm "NOP";
+(slice) udict_get_or_return(cell dict, int key_len, int index) impure asm(index dict key_len) "DICTUGET IFNOTRET";
+(slice) udict_get_or_ret_alt(cell dict, int key_len, int index) impure asm(index dict key_len) "DICTUGET IFNOTRETALT";
+
+forall X -> () consume(X x) impure asm "NOP";
+
+() ret() impure asm "RET";
+() ret_alt() impure asm "RETALT";
+
+(int) stack_has_at_least_2_elements() asm "DEPTH" "1 RSHIFT#";
+(int) stack_has_at_least_4_elements() asm "DEPTH" "2 RSHIFT#";
 
 ;; Extensible wallet contract v5
 
@@ -40,7 +56,7 @@ int pack_address(int wc, int hash) impure asm "SWAP INC XOR"; ;; hash ^ (wc+1)
     return ();
   }
 -}
-() set_actions_if_simple(slice cs) impure asm "DUP" "1 PLDU" "IFNOTJMP:<{ PLDREF c5 POP }>" "DROP";
+() set_actions_if_simple(slice cs) impure asm "DUP" "1 PLDU" "IFNOTJMP:<{ PLDREF c5 POP RETALT }>" "DROP";
 
 ;; Dispatches already authenticated request.
 () dispatch_complex_request_inline(int stored_seqno, slice cs, slice immutable_tail, int stored_subwallet, int public_key) impure inline {
@@ -110,12 +126,7 @@ int pack_address(int wc, int hash) impure asm "SWAP INC XOR"; ;; hash ^ (wc+1)
   dispatch_complex_request_iref(stored_seqno, cs, immutable_tail, stored_subwallet, public_key);
 }
 
-() dispatch_extension_request(slice cs, var dummy1, var dummy2) impure inline {
-  set_actions_if_simple(cs); ;; <- ifnot (cs.preload_uint(1)) { set_actions(cs.preload_ref()); return (); }
-  ;; <<<<<<<<<<---------- CONTEST TEST CUTOFF POINT ---------->>>>>>>>>>
-  ;;
-  dummy1~impure_touch(); ;; DROP merged to 2DROP!
-  dummy2~impure_touch(); ;; Thats 3 BLKDROP now!
+() dispatch_extension_request_2(slice cs) impure inline_ref {
   var ds = get_data().begin_parse();
   var stored_seqno = ds~load_uint(32);
   var immutable_tail = ds; ;; stored_subwallet ~ public_key ~ extensions
@@ -124,6 +135,15 @@ int pack_address(int wc, int hash) impure asm "SWAP INC XOR"; ;; hash ^ (wc+1)
   ;; Note: If after modifications code becomes so large it undesirably splits to cells,
   ;;       replace with dispatch_complex_request_iref. This won't affect test cases but will affect GGC slightly.
   dispatch_complex_request_inline(stored_seqno, cs, immutable_tail, stored_subwallet, public_key);
+}
+
+() dispatch_extension_request(slice cs, var dummy1, var dummy2) impure inline {
+  set_actions_if_simple(cs); ;; <- ifnot (cs.preload_uint(1)) { set_actions(cs.preload_ref()); return (); }
+  ;; <<<<<<<<<<---------- CONTEST TEST CUTOFF POINT ---------->>>>>>>>>>
+  ;;
+  dummy1~impure_touch(); ;; DROP merged to 2DROP!
+  dummy2~impure_touch(); ;; Thats 3 BLKDROP now!
+  dispatch_extension_request_2(cs);
 }
 
 ;; Verifies signed request, prevents replays and proceeds with `dispatch_request`.
@@ -216,17 +236,112 @@ int pack_address(int wc, int hash) impure asm "SWAP INC XOR"; ;; hash ^ (wc+1)
 
 }
 
+() offload_extn_processing(slice body, slice full_msg_slice) impure inline {
+
+}
+
 ;; Basic entry point for received messages (both external and internal).
 ;; recv_internal and recv_external are NOT implicitly used anymore!
 ;; use msg_value or full_msg ONLY if you are sure these are supplied - if is_external = 0! ~ a very thin ice here!
 
 () entry_point_recv(int msg_value, cell full_msg, slice body, int is_external) impure {
-  ifnot (is_external) {
-    process_internal_message(msg_value, full_msg, body);
-    return();
+  (int auth_kind, body) = body.load_uint32_or_ret();
+
+  ifnot (is_external) { ;; true for internal messages, else false
+    ;; this part of code is executed only for internal messages
+    var full_msg_slice = full_msg.begin_parse();
+    var flags = full_msg_slice~load_uint(4);  ;; int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddressInt ...
+    ;; return_if_bounce(3); <- as a test (since there are no bounce tests) - this works (breaks tests)!
+    return_if_bounce(flags); ;; <- if (flags & 1) { return (); }
+
+    if (auth_kind == 0x6578746E) { ;; "extn" authenticated by extension
+
+      var ds = get_data().begin_parse();
+      ;; It is not required to read this data here, maybe ext is doing simple transfer where those are not needed
+      var extensions = ds.skip_bits(32 + 80 + 256).preload_dict();
+
+      ;; Authenticate extension by its address.
+      int packed_sender_addr = pack_address(parse_std_addr(full_msg_slice~load_msg_addr())); ;; no PLDMSGADDR exists
+      ;; Note that some random contract may have deposited funds with this prefix,
+      ;; so we accept the funds silently instead of throwing an error (wallet v4 does the same).
+      var wc = extensions.udict_get_or_return(256, packed_sender_addr); ;; kindof ifnot (success?) { return(); }
+
+      ;; auth_kind and wc are passed into dispatch_extension_request and later are dropped in batch with 3 BLKDROP
+      dispatch_extension_request(body, auth_kind, wc); ;; Special route for external address authenticated request
+
+      ret();
+    }
   }
-  process_external_message(body);
+
+  return_if_not_equal(auth_kind, 0x7369676E); ;; "sign" authenticated by signature
+
+  var ds = get_data().begin_parse();
+  var stored_seqno = ds~load_uint(32);
+  var immutable_tail = ds; ;; stored_subwallet ~ public_key ~ extensions
+  var stored_subwallet = ds~load_uint(80);
+  var public_key = ds.preload_uint(256);
+  process_signed_request(body, stored_seqno, immutable_tail, stored_subwallet, public_key);
+
+  full_msg.consume();
+  msg_value.consume();
+
+  ;; return_if_not_equal(auth_kind, 0x6578746E); ;; "extn" authenticated by extension
+
+  {-
+  var ds = get_data().begin_parse();
+  ;; It is not required to read this data here, maybe ext is doing simple transfer where those are not needed
+  var extensions = ds.skip_bits(32 + 80 + 256).preload_dict();
+
+  ;; Authenticate extension by its address.
+  int packed_sender_addr = pack_address(parse_std_addr(full_msg_slice~load_msg_addr())); ;; no PLDMSGADDR exists
+  ;; Note that some random contract may have deposited funds with this prefix,
+  ;; so we accept the funds silently instead of throwing an error (wallet v4 does the same).
+  var wc = extensions.udict_get_or_ret_alt(256, packed_sender_addr); ;; kindof ifnot (success?) { return(); }
+
+  ;; auth_kind and wc are passed into dispatch_extension_request and later are dropped in batch with 3 BLKDROP
+  dispatch_extension_request(body, auth_kind, wc); ;; Special route for external address authenticated request
+  -}
+
+  ;; ignore_int_params(msg_value, full_msg); ;; does nothing but prevents dropping them which will cause stack underflow
+
+  {-
+
+  ifnot (is_external) { ;; if (is_internal)
+    ;; this part of code is executed only for internal messages
+    var full_msg_slice = full_msg.begin_parse();
+    var flags = full_msg_slice~load_uint(4);  ;; int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddressInt ...
+    ;; return_if_bounce(3); <- as a test (since there are no bounce tests) - this works (breaks tests)!
+    return_if_bounce(flags); ;; <- if (flags & 1) { return (); }
+
+    if (auth_kind == 0x6578746E) { ;; "extn" authenticated by extension
+      var ds = get_data().begin_parse();
+      ;; It is not required to read this data here, maybe ext is doing simple transfer where those are not needed
+      var extensions = ds.skip_bits(32 + 80 + 256).preload_dict();
+
+      ;; Authenticate extension by its address.
+      int packed_sender_addr = pack_address(parse_std_addr(full_msg_slice~load_msg_addr())); ;; no PLDMSGADDR exists
+      ;; Note that some random contract may have deposited funds with this prefix,
+      ;; so we accept the funds silently instead of throwing an error (wallet v4 does the same).
+      var wc = extensions.udict_get_or_ret_alt(256, packed_sender_addr); ;; kindof ifnot (success?) { return(); }
+
+      ;; auth_kind and wc are passed into dispatch_extension_request and later are dropped in batch with 3 BLKDROP
+      dispatch_extension_request(body, auth_kind, wc); ;; Special route for external address authenticated request
+
+      ret_alt();
+    }
+  }
+
+  return_if_not_equal(auth_kind, 0x7369676E); ;; "sign" authenticated by signature
+
+  var ds = get_data().begin_parse();
+  var stored_seqno = ds~load_uint(32);
+  var immutable_tail = ds; ;; stored_subwallet ~ public_key ~ extensions
+  var stored_subwallet = ds~load_uint(80);
+  var public_key = ds.preload_uint(256);
+  process_signed_request(body, stored_seqno, immutable_tail, stored_subwallet, public_key);
+
   ignore_int_params(msg_value, full_msg); ;; does nothing but prevents dropping them which will cause stack underflow
+  --}
 }
 
 ;; Get methods
