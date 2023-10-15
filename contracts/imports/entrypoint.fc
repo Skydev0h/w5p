@@ -8,10 +8,13 @@
 ;; contract would compile, however the gas usage will be higher due to recv_internal/external not inlined in root
 () entry_point_recv(int msg_value, cell full_msg, slice body, int is_external) impure {
   ensure_that_compiler_supports_entrypoint();
+  hardcore_entry_point(msg_value, full_msg, body, is_external);
+  {-
   ifnot (is_external) {
     recv_internal(msg_value, full_msg, body);
     return();
   }
   recv_external(body);
   ignore_int_params(msg_value, full_msg); ;; does nothing but prevents dropping them which will cause stack underflow
+  -}
 }

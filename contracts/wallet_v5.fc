@@ -218,6 +218,41 @@ int pack_address((int, int) address) impure asm "SWAP INC XOR"; ;; hash ^ (wc+1)
 
 }
 
+(int) stack_has_at_least_2_elements() asm "DEPTH" "1 RSHIFT#";
+(int) stack_has_at_least_4_elements() asm "DEPTH" "2 RSHIFT#";
+
+() process_extn(int msg_value, cell full_msg, slice body) impure inline {
+  var full_msg_slice = full_msg.begin_parse();
+  var s_flags = full_msg_slice~load_bits(4);
+  slicy_return_if_bounce(s_flags);
+  int packed_sender_addr = pack_address(parse_std_addr(full_msg_slice~load_msg_addr()));
+  var ds = get_data().begin_parse();
+  var extensions = ds.skip_bits(32 + 80 + 256).preload_dict();
+  var wc = extensions.udict_get_or_return(256, packed_sender_addr);
+  dispatch_extension_request(body, wc);
+  ;; TODO: Block-drop msg_value
+}
+
+() hardcore_entry_point(int msg_value, cell full_msg, slice body, int is_external) impure inline {
+  ifnot (is_external) {
+    (body, int is_extn) = check_and_remove_extn_prefix(body);
+    if (is_extn) {
+      process_extn(msg_value, full_msg, body);
+      return();
+    }
+  }
+
+  ;; body should be at top of the stack right now
+  body = check_and_remove_sign_prefix_or_ret(body);
+
+  if (stack_has_at_least_2_elements()) {
+    slicy_return_if_bounce(full_msg.begin_parse().preload_bits(4));
+  }
+
+  process_signed_request(body);
+  ignore_int_params(msg_value, full_msg);
+}
+
 ;; N.B. If compiled by an compiler that does not support entry_point_recv this method will be ignored and the
 ;; contract would compile, however the gas usage will be higher due to recv_internal/external not inlined in root
 
